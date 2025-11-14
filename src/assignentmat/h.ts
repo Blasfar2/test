@@ -585,5 +585,184 @@ describe('AutoAssignment E2E', () => {
 ///////////////////////////////////////////////////////////////////////
 //
 //
-//  Tests E2E complets
+//  Service pour générer un fichier Excel template
 ///////////////////////////////////////////////////////////////////////
+import { Injectable, Logger } from '@nestjs/common';
+import * as XLSX from 'xlsx';
+
+@Injectable()
+export class DeliveryAssignmentTemplateService {
+  private readonly logger = new Logger(DeliveryAssignmentTemplateService.name);
+
+  generateTemplate(): Buffer {
+    try {
+      // Créer les données template
+      const templateData = [
+        {
+          orderNumber: 'ORD-001',
+          deliveryPersonId: 'DEL-12345',
+        },
+        {
+          orderNumber: 'ORD-002',
+          deliveryPersonId: 'DEL-67890',
+        },
+        {
+          orderNumber: 'ORD-003',
+          deliveryPersonId: 'DEL-11111',
+        },
+      ];
+
+      // Créer le workbook
+      const workbook = XLSX.utils.book_new();
+      const worksheet = XLSX.utils.json_to_sheet(templateData);
+
+      // Ajouter du styling
+      worksheet['!cols'] = [{ wch: 20 }, { wch: 20 }];
+
+      XLSX.utils.book_append_sheet(workbook, worksheet, 'Assignments');
+
+      // Générer le buffer
+      const buffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'buffer' });
+
+      this.logger.log('Generated delivery assignment template');
+      return buffer;
+    } catch (error) {
+      this.logger.error(`Failed to generate template: ${error?.message}`);
+      throw error;
+    }
+  }
+}
+///////////////////////////////////////////////////////////////////////
+//
+//
+//   Mettre à jour le contrôleur avec l'endpoint template
+///////////////////////////////////////////////////////////////////////
+import {
+  Controller,
+  Post,
+  Get,
+  UseInterceptors,
+  UploadedFile,
+  BadRequestException,
+  Logger,
+  Res,
+} from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { Response } from 'express';
+import { AutoAssignmentService } from './auto-assignment.service';
+import { DeliveryAssignmentTemplateService } from './services/delivery-assignment-template.service';
+
+@Controller('auto-assignment')
+export class AutoAssignmentController {
+  private readonly logger = new Logger(AutoAssignmentController.name);
+
+  constructor(
+    private readonly autoAssignmentService: AutoAssignmentService,
+    private readonly templateService: DeliveryAssignmentTemplateService,
+  ) {}
+
+  @Get('download-template')
+  downloadTemplate(@Res() res: Response) {
+    try {
+      const buffer = this.templateService.generateTemplate();
+
+      res.setHeader(
+        'Content-Disposition',
+        'attachment; filename="delivery-assignments-template.xlsx"',
+      );
+      res.setHeader(
+        'Content-Type',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      );
+      res.send(buffer);
+
+      this.logger.log('Template downloaded');
+    } catch (error) {
+      this.logger.error(`Failed to download template: ${error?.message}`);
+      throw error;
+    }
+  }
+
+  @Post('upload-delivery-assignments')
+  @UseInterceptors(FileInterceptor('file'))
+  async uploadDeliveryAssignments(@UploadedFile() file: Express.Multer.File) {
+    if (!file) {
+      throw new BadRequestException('No file uploaded');
+    }
+
+    if (!file.originalname.endsWith('.xlsx') && !file.originalname.endsWith('.xls')) {
+      throw new BadRequestException('Only Excel files (.xlsx, .xls) are allowed');
+    }
+
+    this.logger.log(`Processing file: ${file.originalname}`);
+
+    const result = await this.autoAssignmentService.assignDeliveryPersonsFromExcel(
+      file.buffer,
+    );
+
+    return result;
+  }
+}
+///////////////////////////////////////////////////////////////////////
+//
+//
+//   Mettre à jour le module
+///////////////////////////////////////////////////////////////////////
+import { Module } from '@nestjs/common';
+import { AutoAssignmentService } from './auto-assignment.service';
+import { AutoAssignmentController } from './auto-assignment.controller';
+import { ClientsZoneAssignmentService } from './clients-zone-assignment.service';
+import { DeliveryPersonExcelParserService } from './services/delivery-person-excel-parser.service';
+import { DeliveryPersonAssignmentService } from './services/delivery-person-assignment.service';
+import { DeliveryAssignmentTemplateService } from './services/delivery-assignment-template.service';
+import { CommercetoolsModule } from 'src/commercetools/commercetools.module';
+import { ClientsModule } from 'src/clients/clients.module';
+
+@Module({
+  imports: [CommercetoolsModule, ClientsModule],
+  providers: [
+    AutoAssignmentService,
+    ClientsZoneAssignmentService,
+    DeliveryPersonExcelParserService,
+    DeliveryPersonAssignmentService,
+    DeliveryAssignmentTemplateService,
+  ],
+  controllers: [AutoAssignmentController],
+  exports: [
+    AutoAssignmentService,
+    DeliveryPersonAssignmentService,
+    DeliveryAssignmentTemplateService,
+  ],
+})
+export class AutoAssignmentModule {}
+///////////////////////////////////////////////////////////////////////
+//
+//
+//   Tests pour le template
+///////////////////////////////////////////////////////////////////////
+// À ajouter dans : /home/user/Desktop/BackOffice/lbv-atc-ct-backoffice-backend/src/auto-assignment/__tests__/auto-assignment.e2e.spec.ts
+
+describe('GET /auto-assignment/download-template', () => {
+  it('should download Excel template', async () => {
+    const response = await request(app.getHttpServer())
+      .get('/auto-assignment/download-template')
+      .expect(200)
+      .expect('Content-Type', /spreadsheetml/);
+
+    expect(response.headers['content-disposition']).toContain('attachment');
+    expect(response.headers['content-disposition']).toContain(
+      'delivery-assignments-template.xlsx',
+    );
+
+    // Vérifier que c'est un fichier Excel valide
+    const workbook = XLSX.read(response.body, { type: 'buffer' });
+    expect(workbook.SheetNames).toContain('Assignments');
+
+    const worksheet = workbook.Sheets['Assignments'];
+    const data = XLSX.utils.sheet_to_json(worksheet);
+
+    expect(data.length).toBeGreaterThan(0);
+    expect(data[0]).toHaveProperty('orderNumber');
+    expect(data[0]).toHaveProperty('deliveryPersonId');
+  });
+});
