@@ -217,3 +217,373 @@ export class AutoAssignmentService {
   }
 }
 
+///////////////////////////////////////////////////////////////////////
+//
+//
+//  STEP 4A : Contrôleur pour l'upload Excel
+///////////////////////////////////////////////////////////////////////
+
+import {
+  Controller,
+  Post,
+  UseInterceptors,
+  UploadedFile,
+  BadRequestException,
+  Logger,
+} from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { AutoAssignmentService } from './auto-assignment.service';
+
+@Controller('auto-assignment')
+export class AutoAssignmentController {
+  private readonly logger = new Logger(AutoAssignmentController.name);
+
+  constructor(private readonly autoAssignmentService: AutoAssignmentService) {}
+
+  @Post('upload-delivery-assignments')
+  @UseInterceptors(FileInterceptor('file'))
+  async uploadDeliveryAssignments(@UploadedFile() file: Express.Multer.File) {
+    if (!file) {
+      throw new BadRequestException('No file uploaded');
+    }
+
+    if (!file.originalname.endsWith('.xlsx') && !file.originalname.endsWith('.xls')) {
+      throw new BadRequestException('Only Excel files (.xlsx, .xls) are allowed');
+    }
+
+    this.logger.log(`Processing file: ${file.originalname}`);
+
+    const result = await this.autoAssignmentService.assignDeliveryPersonsFromExcel(
+      file.buffer,
+    );
+
+    return result;
+  }
+}
+
+///////////////////////////////////////////////////////////////////////
+//
+//
+//  STEP 4B : Mettre à jour le module
+///////////////////////////////////////////////////////////////////////
+
+import { Module } from '@nestjs/common';
+import { AutoAssignmentService } from './auto-assignment.service';
+import { AutoAssignmentController } from './auto-assignment.controller';
+import { ClientsZoneAssignmentService } from './clients-zone-assignment.service';
+import { DeliveryPersonExcelParserService } from './services/delivery-person-excel-parser.service';
+import { DeliveryPersonAssignmentService } from './services/delivery-person-assignment.service';
+import { CommercetoolsModule } from 'src/commercetools/commercetools.module';
+import { ClientsModule } from 'src/clients/clients.module';
+
+@Module({
+  imports: [CommercetoolsModule, ClientsModule],
+  providers: [
+    AutoAssignmentService,
+    ClientsZoneAssignmentService,
+    DeliveryPersonExcelParserService,
+    DeliveryPersonAssignmentService,
+  ],
+  controllers: [AutoAssignmentController],
+  exports: [AutoAssignmentService, DeliveryPersonAssignmentService],
+})
+export class AutoAssignmentModule {}
+
+
+///////////////////////////////////////////////////////////////////////
+//
+//
+//  Tests E2E complets
+///////////////////////////////////////////////////////////////////////
+import { Test, TestingModule } from '@nestjs/testing';
+import { INestApplication, BadRequestException } from '@nestjs/common';
+import * as request from 'supertest';
+import * as XLSX from 'xlsx';
+import { AutoAssignmentModule } from '../auto-assignment.module';
+import { CommercetoolsService } from 'src/commercetools/commercetools.service';
+import { DeliveryPersonAssignmentService } from '../services/delivery-person-assignment.service';
+import { DeliveryPersonExcelParserService } from '../services/delivery-person-excel-parser.service';
+
+describe('AutoAssignment E2E', () => {
+  let app: INestApplication;
+  let commercetoolsService: CommercetoolsService;
+  let deliveryPersonAssignmentService: DeliveryPersonAssignmentService;
+  let excelParserService: DeliveryPersonExcelParserService;
+
+  // Mock data
+  const mockCustomer = {
+    id: 'customer-123',
+    email: 'customer@test.com',
+    firstName: 'John',
+    lastName: 'Doe',
+  };
+
+  const mockDeliveryPerson = {
+    id: 'delivery-person-456',
+    firstName: 'Jane',
+    lastName: 'Smith',
+    email: 'jane@test.com',
+  };
+
+  const mockOrder = {
+    id: 'order-789',
+    orderNumber: 'ORD-001',
+    version: 1,
+    customerId: mockCustomer.id,
+    lineItems: [],
+    custom: {
+      fields: {},
+    },
+  };
+
+  beforeAll(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      imports: [AutoAssignmentModule],
+    })
+      .overrideProvider(CommercetoolsService)
+      .useValue({
+        getOrderByNumber: jest.fn(),
+        updateOrderCustomFields: jest.fn(),
+        createCustomer: jest.fn(),
+        createOrder: jest.fn(),
+      })
+      .compile();
+
+    app = module.createNestApplication();
+    await app.init();
+
+    commercetoolsService = module.get<CommercetoolsService>(CommercetoolsService);
+    deliveryPersonAssignmentService = module.get<DeliveryPersonAssignmentService>(
+      DeliveryPersonAssignmentService,
+    );
+    excelParserService = module.get<DeliveryPersonExcelParserService>(
+      DeliveryPersonExcelParserService,
+    );
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  describe('POST /auto-assignment/upload-delivery-assignments', () => {
+    it('should reject if no file is uploaded', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auto-assignment/upload-delivery-assignments')
+        .expect(400);
+
+      expect(response.body.message).toContain('No file uploaded');
+    });
+
+    it('should reject non-Excel files', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/auto-assignment/upload-delivery-assignments')
+        .attach('file', Buffer.from('invalid content'), 'test.txt')
+        .expect(400);
+
+      expect(response.body.message).toContain('Only Excel files');
+    });
+
+    it('should parse valid Excel file and assign delivery persons', async () => {
+      // Créer un fichier Excel mock
+      const excelData = [
+        {
+          orderNumber: 'ORD-001',
+          deliveryPersonId: 'delivery-person-456',
+        },
+        {
+          orderNumber: 'ORD-002',
+          deliveryPersonId: 'delivery-person-789',
+        },
+      ];
+
+      const workbook = XLSX.utils.book_new();
+      const worksheet = XLSX.utils.json_to_sheet(excelData);
+      XLSX.utils.book_append_sheet(workbook, worksheet, 'Sheet1');
+      const excelBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'buffer' });
+
+      // Mock les appels Commercetools
+      (commercetoolsService.getOrderByNumber as jest.Mock)
+        .mockResolvedValueOnce(mockOrder)
+        .mockResolvedValueOnce({ ...mockOrder, orderNumber: 'ORD-002', id: 'order-790' });
+
+      (commercetoolsService.updateOrderCustomFields as jest.Mock)
+        .mockResolvedValueOnce({ ...mockOrder, custom: { fields: { deliveryPersonId: 'delivery-person-456' } } })
+        .mockResolvedValueOnce({ ...mockOrder, orderNumber: 'ORD-002', custom: { fields: { deliveryPersonId: 'delivery-person-789' } } });
+
+      const response = await request(app.getHttpServer())
+        .post('/auto-assignment/upload-delivery-assignments')
+        .attach('file', excelBuffer, 'assignments.xlsx')
+        .expect(200);
+
+      expect(response.body).toEqual({
+        totalProcessed: 2,
+        successful: 2,
+        failed: 0,
+        details: expect.arrayContaining([
+          expect.objectContaining({
+            orderNumber: 'ORD-001',
+            deliveryPersonId: 'delivery-person-456',
+            success: true,
+          }),
+          expect.objectContaining({
+            orderNumber: 'ORD-002',
+            deliveryPersonId: 'delivery-person-789',
+            success: true,
+          }),
+        ]),
+        invalidRows: [],
+      });
+    });
+
+    it('should handle missing orders gracefully', async () => {
+      const excelData = [
+        {
+          orderNumber: 'NON-EXISTENT',
+          deliveryPersonId: 'delivery-person-456',
+        },
+      ];
+
+      const workbook = XLSX.utils.book_new();
+      const worksheet = XLSX.utils.json_to_sheet(excelData);
+      XLSX.utils.book_append_sheet(workbook, worksheet, 'Sheet1');
+      const excelBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'buffer' });
+
+      (commercetoolsService.getOrderByNumber as jest.Mock).mockResolvedValueOnce(null);
+
+      const response = await request(app.getHttpServer())
+        .post('/auto-assignment/upload-delivery-assignments')
+        .attach('file', excelBuffer, 'assignments.xlsx')
+        .expect(200);
+
+      expect(response.body.successful).toBe(0);
+      expect(response.body.failed).toBe(1);
+      expect(response.body.details[0].success).toBe(false);
+      expect(response.body.details[0].error).toContain('Order not found');
+    });
+
+    it('should validate Excel data and report invalid rows', async () => {
+      const excelData = [
+        {
+          orderNumber: 'ORD-001',
+          deliveryPersonId: 'delivery-person-456',
+        },
+        {
+          orderNumber: '', // Missing orderNumber
+          deliveryPersonId: 'delivery-person-789',
+        },
+        {
+          orderNumber: 'ORD-003',
+          deliveryPersonId: '', // Missing deliveryPersonId
+        },
+      ];
+
+      const workbook = XLSX.utils.book_new();
+      const worksheet = XLSX.utils.json_to_sheet(excelData);
+      XLSX.utils.book_append_sheet(workbook, worksheet, 'Sheet1');
+      const excelBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'buffer' });
+
+      (commercetoolsService.getOrderByNumber as jest.Mock).mockResolvedValueOnce(mockOrder);
+      (commercetoolsService.updateOrderCustomFields as jest.Mock).mockResolvedValueOnce(mockOrder);
+
+      const response = await request(app.getHttpServer())
+        .post('/auto-assignment/upload-delivery-assignments')
+        .attach('file', excelBuffer, 'assignments.xlsx')
+        .expect(200);
+
+      expect(response.body.totalProcessed).toBe(3);
+      expect(response.body.successful).toBe(1);
+      expect(response.body.failed).toBe(0);
+      expect(response.body.invalidRows.length).toBe(2);
+      expect(response.body.invalidRows).toContainEqual(
+        expect.objectContaining({
+          row: 2,
+          reason: 'Missing orderNumber',
+        }),
+      );
+      expect(response.body.invalidRows).toContainEqual(
+        expect.objectContaining({
+          row: 3,
+          reason: 'Missing deliveryPersonId',
+        }),
+      );
+    });
+  });
+
+  describe('DeliveryPersonAssignmentService', () => {
+    it('should assign delivery person to order', async () => {
+      (commercetoolsService.getOrderByNumber as jest.Mock).mockResolvedValueOnce(mockOrder);
+      (commercetoolsService.updateOrderCustomFields as jest.Mock).mockResolvedValueOnce({
+        ...mockOrder,
+        custom: { fields: { deliveryPersonId: mockDeliveryPerson.id } },
+      });
+
+      const result = await deliveryPersonAssignmentService.assignDeliveryPersonToOrder({
+        orderNumber: mockOrder.orderNumber,
+        deliveryPersonId: mockDeliveryPerson.id,
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.orderNumber).toBe(mockOrder.orderNumber);
+      expect(result.deliveryPersonId).toBe(mockDeliveryPerson.id);
+      expect(commercetoolsService.updateOrderCustomFields).toHaveBeenCalledWith(
+        mockOrder.id,
+        mockOrder.version,
+        { deliveryPersonId: mockDeliveryPerson.id },
+      );
+    });
+
+    it('should return error when order not found', async () => {
+      (commercetoolsService.getOrderByNumber as jest.Mock).mockResolvedValueOnce(null);
+
+      const result = await deliveryPersonAssignmentService.assignDeliveryPersonToOrder({
+        orderNumber: 'NON-EXISTENT',
+        deliveryPersonId: mockDeliveryPerson.id,
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Order not found');
+    });
+  });
+
+  describe('DeliveryPersonExcelParserService', () => {
+    it('should parse valid Excel file', () => {
+      const excelData = [
+        { orderNumber: 'ORD-001', deliveryPersonId: 'DEL-001' },
+        { orderNumber: 'ORD-002', deliveryPersonId: 'DEL-002' },
+      ];
+
+      const workbook = XLSX.utils.book_new();
+      const worksheet = XLSX.utils.json_to_sheet(excelData);
+      XLSX.utils.book_append_sheet(workbook, worksheet, 'Sheet1');
+      const excelBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'buffer' });
+
+      const result = excelParserService.parseExcelFile(excelBuffer);
+
+      expect(result).toHaveLength(2);
+      expect(result[0]).toEqual({
+        orderNumber: 'ORD-001',
+        deliveryPersonId: 'DEL-001',
+      });
+    });
+
+    it('should validate assignments correctly', () => {
+      const assignments = [
+        { orderNumber: 'ORD-001', deliveryPersonId: 'DEL-001' },
+        { orderNumber: '', deliveryPersonId: 'DEL-002' },
+        { orderNumber: 'ORD-003', deliveryPersonId: '' },
+      ];
+
+      const { valid, invalid } = excelParserService.validateAssignments(assignments);
+
+      expect(valid).toHaveLength(1);
+      expect(invalid).toHaveLength(2);
+      expect(invalid[0].reason).toBe('Missing orderNumber');
+      expect(invalid[1].reason).toBe('Missing deliveryPersonId');
+    });
+  });
+});
+///////////////////////////////////////////////////////////////////////
+//
+//
+//  Tests E2E complets
+///////////////////////////////////////////////////////////////////////
